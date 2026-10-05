@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "cortex-model-compatibility-matrix"
+version = "0.1.0"
+description = "Evidence-based Cortex REST and proxy model qualification"
+requires-python = ">=3.11"
+dependencies = []
+
+[project.optional-dependencies]
+sdk = ["httpx==0.28.1", "openai==2.48.0", "langchain-openai==1.4.1", "langgraph==1.2.9"]
+
+[project.scripts]
+cortex-model-test = "model_probe.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["model_probe*"]

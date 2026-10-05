@@ -1,0 +1,15 @@
+.venv/
+__pycache__/
+*.pyc
+*.egg-info/
+build/
+dist/
+results/
+matrix-*/
+.env
+.env.*
+*.pem
+*.key
+*.enc
+connections.toml
+config.local.*

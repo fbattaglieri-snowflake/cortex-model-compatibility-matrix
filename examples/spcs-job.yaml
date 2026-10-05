@@ -1,0 +1,41 @@
+# Template only: replace image/host/model and explicitly approve job creation.
+# No endpoints, application secrets or application mounts. Not executed by the CLI.
+# Discovery happens separately. This tests the account HTTP path, not a proxy.
+spec:
+  containers:
+    - name: probe
+      image: /YOUR_DB/YOUR_SCHEMA/YOUR_REPOSITORY/model-probe:YOUR_TAG
+      command:
+        - python
+        - -m
+        - model_probe.cli
+        - run
+        - --live
+        - --scope
+        - service-rest
+        - --expected-account
+        - YOUR_LOCATOR
+        - --base-url
+        - https://YOUR_ORG-YOUR_ACCOUNT.snowflakecomputing.com/api/v2/cortex/v1
+        - --expected-host
+        - YOUR_ORG-YOUR_ACCOUNT.snowflakecomputing.com
+        - --model
+        - YOUR_MODEL_ID
+        - --protocol
+        - chat
+        - --auth-type
+        - OAUTH
+        - --token-file
+        - /snowflake/session/token
+        - --output
+        - /tmp/evidence
+      resources:
+        requests:
+          cpu: 0.1
+          memory: 128Mi
+        limits:
+          cpu: 1
+          memory: 512Mi
+# Summary is printed; per-case files are ephemeral. Arrange an approved private
+# evidence export before relying on this job for release qualification. The
+# service-rest scope checks the SPCS account environment, not SQL discovery.

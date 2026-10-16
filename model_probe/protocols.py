@@ -113,6 +113,44 @@ def followup(request, response, protocol, fail=False):
     return {**request, key: history}
 
 
+def reused_tool_ids(first_response, second_response, protocol):
+    """Return True when two separate tool-call turns reuse any tool call identifier (e.g. call_0)."""
+    first_ids = {item["id"] for item in calls(first_response, protocol)}
+    second_ids = {item["id"] for item in calls(second_response, protocol)}
+    return bool(first_ids & second_ids)
+
+
+def multiround_followup(request, response, protocol, *, round_index=1, fail=False):
+    """Append a tool-call round while ensuring IDs remain unique across multi-round transcripts."""
+    import copy
+    response_copy = copy.deepcopy(response)
+    key = "input" if protocol == "responses" else "messages"
+    existing_ids = set()
+    for msg in request.get(key, []):
+        if not isinstance(msg, dict):
+            continue
+        if protocol == "chat":
+            existing_ids.update(tc.get("id") for tc in (msg.get("tool_calls") or []) if isinstance(tc, dict) and tc.get("id"))
+        elif protocol == "responses" and msg.get("type") == "function_call" and msg.get("call_id"):
+            existing_ids.add(msg["call_id"])
+        elif protocol == "messages" and isinstance(msg.get("content"), list):
+            existing_ids.update(b.get("id") for b in msg["content"] if isinstance(b, dict) and b.get("type") == "tool_use" and b.get("id"))
+    if existing_ids:
+        if protocol == "chat":
+            for tc in response_copy["choices"][0]["message"].get("tool_calls", []):
+                if tc.get("id") in existing_ids:
+                    tc["id"] = f"{tc['id']}_r{round_index}"
+        elif protocol == "responses":
+            for item in response_copy.get("output", []):
+                if item.get("type") == "function_call" and item.get("call_id") in existing_ids:
+                    item["call_id"] = f"{item['call_id']}_r{round_index}"
+        else:
+            for block in response_copy.get("content", []):
+                if block.get("type") == "tool_use" and block.get("id") in existing_ids:
+                    block["id"] = f"{block['id']}_r{round_index}"
+    return followup(request, response_copy, protocol, fail=fail)
+
+
 def sse_events(raw):
     normalized = raw.replace(b"\r\n", b"\n")
     parts = normalized.split(b"\n\n")
@@ -126,12 +164,18 @@ def sse_events(raw):
 
 def decode_stream(raw, protocol):
     ended, usage = False, []
+    trailing_done = False
     result = None
     chat_text, fragments, finish = "", {}, None
     blocks, closed = {}, set()
     response_deltas = ""
     for data in sse_events(raw):
         if ended:
+            # Cortex Responses may append one sentinel after the real completion.
+            # It cannot supply completion or authorize any subsequent payload.
+            if protocol == "responses" and data == "[DONE]" and not trailing_done:
+                trailing_done = True
+                continue
             raise ValueError("Data after terminal event")
         if data == "[DONE]":
             if protocol != "chat" or not finish:

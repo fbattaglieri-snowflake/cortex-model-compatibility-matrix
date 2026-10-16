@@ -45,6 +45,16 @@ class ProtocolTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             calls(chat(tool_calls=items), "chat")
 
+    def test_multiround_reused_tool_ids_detection_and_deduplication(self):
+        r1 = chat(tool_calls=[{"id": "call_0", "function": {"name": "lookup_fixture", "arguments": '{"key":"alpha"}'}}])
+        r2 = chat(tool_calls=[{"id": "call_0", "function": {"name": "lookup_fixture", "arguments": '{"key":"beta"}'}}])
+        self.assertTrue(reused_tool_ids(r1, r2, "chat"))
+        req = payload("chat", "grok-4.6", "Two rounds", with_tools=True)
+        step1 = multiround_followup(req, r1, "chat", round_index=1)
+        step2 = multiround_followup(step1, r2, "chat", round_index=2)
+        tool_ids = [m["tool_call_id"] for m in step2["messages"] if m.get("role") == "tool"]
+        self.assertEqual(tool_ids, ["call_0", "call_0_r2"])
+
     def test_responses_preserves_reasoning(self):
         result = {"output": [{"type": "reasoning", "encrypted_content": "synthetic"},
                  {"type": "function_call", "call_id": "one", "name": "lookup_fixture", "arguments": '{"key":"alpha"}'}]}
@@ -82,6 +92,20 @@ class ProtocolTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 decode_stream(('data: ' + json.dumps({"type": kind}) + '\n\n').encode(), "responses")
 
+    def test_responses_optional_sentinel_does_not_replace_completion(self):
+        body = {"status": "completed", "output": []}
+        raw = ('data: ' + json.dumps({"type": "response.completed", "response": body}) + '\n\n').encode()
+        done = b'data: [DONE]\n\n'
+        self.assertEqual(decode_stream(raw + done, "responses")[0], body)
+        for invalid in (done, raw + done + done, raw + b'data: {}\n\n',
+                        raw + done + raw, raw + done + b'data: {}\n\n'):
+            with self.subTest(invalid=invalid), self.assertRaises(ValueError):
+                decode_stream(invalid, "responses")
+        for kind in ('response.failed', 'response.incomplete'):
+            invalid = ('data: ' + json.dumps({'type': kind, 'response': body}) + '\n\n').encode()
+            with self.assertRaises(ValueError):
+                decode_stream(invalid + done, 'responses')
+
     def test_messages_complete(self):
         events = [{"type": "message_start", "message": {"content": []}},
             {"type": "content_block_start", "index": 0, "content_block": {"type": "text", "text": ""}},
@@ -95,6 +119,25 @@ class ProtocolTests(unittest.TestCase):
 
 
 class SafetyTests(unittest.TestCase):
+    def test_decoder_failure_retains_wire_without_becoming_pass(self):
+        raw = b'data: {"type":"response.completed","response":{"status":"completed","output":[]}}\n\ndata: {}\n\n'
+        class Response:
+            code = 200
+            headers = {'content-type': 'text/event-stream', 'x-snowflake-request-id': 'synthetic-id'}
+            def read(self, size): return raw
+            def __enter__(self): return self
+            def __exit__(self, *args): pass
+        transport = Transport('http://localhost:8080/v1', 'localhost', local=True)
+        with tempfile.TemporaryDirectory() as directory, patch.object(transport.opener, 'open', return_value=Response()):
+            campaign = Campaign(transport, 'synthetic', 'responses', Path(directory) / 'run')
+            self.assertIsNone(campaign.check(1, 'stream_text', {'stream': True}, lambda result: True))
+            row = campaign.rows[0]
+            self.assertEqual(row['status'], 'FAIL')
+            self.assertEqual(row['http_status'], 200)
+            self.assertEqual(row['request_id'], 'synthetic-id')
+            self.assertEqual(row['raw_response'].encode(), raw)
+            self.assertEqual(row['failure_class'], 'ValueError')
+
     def test_url_guard(self):
         for url in ("http://account.example/v1", "https://evil.example/v1", "https://u:p@account.example/v1",
                     "https://account.example/v1?token=x", "https://account.example/other"):
@@ -204,10 +247,15 @@ class SafetyTests(unittest.TestCase):
                         if keys else [{"type": "message", "content": [{"type": "output_text", "text": answer}]}]}
                 return result, {"http_status": 200}
             transport = Transport("http://localhost:8080/v1", "localhost", local=True)
-            with tempfile.TemporaryDirectory() as directory, patch.object(transport, "send", side_effect=synthetic_send):
-                summary = Campaign(transport, "synthetic", protocol, Path(directory) / "run").run()
-                self.assertEqual(summary["counts"], {"PASS": 39}, protocol)
-                self.assertEqual(summary["status"], "PROFILE_QUALIFIED")
+            for capabilities, expected in ((None, {"PASS": 39}),
+                    (["text", "tools", "parallel_tools"], {"PASS": 24, "NOT TESTED": 15}),
+                    (["text", "tools", "parallel_tools", "streaming"], {"PASS": 33, "NOT TESTED": 6}),
+                    (["text", "structured_output"], {"PASS": 12, "NOT TESTED": 27})):
+                with tempfile.TemporaryDirectory() as directory, patch.object(transport, "send", side_effect=synthetic_send) as sent:
+                    summary = Campaign(transport, "synthetic", protocol, Path(directory) / "run", capabilities=capabilities).run()
+                    self.assertEqual(summary["counts"], expected, protocol)
+                    self.assertEqual(sent.call_count, expected["PASS"])
+                    self.assertEqual(summary["status"], "PROFILE_QUALIFIED")
 
     def test_http_errors_are_preserved(self):
         import io

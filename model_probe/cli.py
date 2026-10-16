@@ -6,7 +6,7 @@ import re
 import subprocess
 from pathlib import Path
 
-from .campaign import Campaign, private_write
+from .campaign import Campaign, private_write, CAPABILITIES
 from .transport import Transport, validate_url
 
 
@@ -39,6 +39,11 @@ def main():
     run.add_argument("--inventory", type=Path)
     run.add_argument("--expected-account")
     run.add_argument("--local-proxy", action="store_true")
+    run.add_argument("--expected-base-url", help="Exact approved proxy URL including scheme, port and path")
+    run.add_argument("--internal-proxy", action="store_true",
+                     help="Explicit credential-free HTTP SPCS service mode; requires --expected-base-url")
+    run.add_argument("--capabilities", nargs="+", choices=CAPABILITIES,
+                     help="Required capabilities declared before execution; default: full suite")
     credentials = run.add_mutually_exclusive_group()
     credentials.add_argument("--token-env")
     credentials.add_argument("--token-file")
@@ -57,6 +62,8 @@ def main():
         parser.error("Invalid model identifier")
     if args.local_proxy and args.scope != "proxy":
         parser.error("Loopback mode requires --scope proxy")
+    if (args.expected_base_url or args.internal_proxy) and args.scope != "proxy":
+        parser.error("Custom destination policy requires --scope proxy; direct/service REST remains unchanged")
     if args.scope == "service-rest":
         if (not args.expected_account or os.environ.get("SNOWFLAKE_ACCOUNT", "").upper() != args.expected_account.upper()
                 or args.auth_type != "OAUTH" or not args.token_file):
@@ -71,9 +78,11 @@ def main():
         if args.model.lower() not in {row["name"].lower() for row in inventory_doc["models"]}:
             parser.error("Exact model absent from inventory; no aliases inferred")
     transport = Transport(args.base_url, args.expected_host, token_env=args.token_env,
-        token_file=args.token_file, auth_type=args.auth_type, local=args.local_proxy)
+        token_file=args.token_file, auth_type=args.auth_type, local=args.local_proxy,
+        expected_base_url=args.expected_base_url, internal_proxy=args.internal_proxy)
     campaign = Campaign(transport, args.model, args.protocol, args.output, repeats=args.repeats,
-        reasoning=args.reasoning, max_requests=args.max_requests, deadline=args.deadline, scope=args.scope)
+        reasoning=args.reasoning, max_requests=args.max_requests, deadline=args.deadline, scope=args.scope,
+        capabilities=args.capabilities)
     if args.inventory:
         private_write(args.output / "inventory.json", json.loads(args.inventory.read_text()))
     summary = campaign.run()

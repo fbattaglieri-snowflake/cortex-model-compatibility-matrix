@@ -1,9 +1,10 @@
 # Cortex model compatibility matrix
 
+> **Disclaimer:** This project is an independent community / field-engineering skill and test kit built on top of **Snowflake Cortex REST APIs** and **Snowflake Snowpark Container Services (SPCS)**. It is **NOT an official Snowflake product**, is not part of the official Snowflake product offering, and is provided "as is" without official Snowflake support or warranty.
+
 A standalone Cortex Code skill and Python test kit for qualifying models before
-adding them to an LLM proxy. Community tooling, not an official Snowflake product
-or a guarantee of model availability. No private account data or live results are
-included. The existing application/proxy deployment is not part of this repository.
+adding them to an LLM proxy (such as [**`snowflake-proxy-cortexrestapi`**](https://github.com/fbattaglieri-snowflake/snowflake-proxy-cortexrestapi)).
+No private account data or live results are included.
 
 ## Why this skill exists
 
@@ -145,6 +146,57 @@ python3 scripts/qualify.py run --live \
 Local mode never accepts a Snowflake token. A remote proxy requires HTTPS and
 an explicitly selected credential intended for that host. Never reuse an account
 PAT with an unrelated third-party proxy. Direct and proxy results are separate.
+
+### Explicit proxy paths and internal SPCS tests (v0.2)
+
+Custom protocol base paths require an exact destination approval:
+
+```bash
+python3 /ABSOLUTE/kit/scripts/qualify.py run --live --scope proxy \
+  --base-url https://proxy.example/responses/v1 \
+  --expected-base-url https://proxy.example/responses/v1 \
+  --expected-host proxy.example --token-env PROXY_TOKEN \
+  --model MODEL_ID --protocol responses --output /PRIVATE/new-campaign
+```
+
+Select a credential intended for that proxy. The existing HTTPS transport uses
+Bearer auth, not SPCS public-ingress authentication. Do not assume they are identical.
+The prefix is followed by the native suffix (`/responses` here); configure a base,
+not the full inference URL. Scheme, port and path changes fail exact matching.
+
+For an explicitly authorized credential-free SPCS internal HTTP endpoint, from
+a runner with private service connectivity:
+
+```bash
+python3 /ABSOLUTE/kit/scripts/qualify.py run --live --scope proxy --internal-proxy \
+  --base-url http://service.namespace.svc.spcs.internal:8080/chat/v1 \
+  --expected-base-url http://service.namespace.svc.spcs.internal:8080/chat/v1 \
+  --expected-host service.namespace.svc.spcs.internal \
+  --model MODEL_ID --protocol chat --capabilities text tools parallel_tools \
+  --output /PRIVATE/new-campaign
+```
+
+Replace the illustrative service/namespace with the exact approved address.
+No token environment/file is accepted in HTTP modes. The option does not create
+network access, change grants or support arbitrary HTTP hosts. HTTPS remains the
+default outside explicit loopback/internal modes; redirects remain prohibited.
+
+### Declare capabilities before testing
+
+`--capabilities text tools parallel_tools` qualifies only text/history and the
+single/parallel tool roundtrips (including a synthetic tool error). Streaming and
+structured output are NOT TESTED, not PASS, and incur no requests in that campaign.
+Available names: `text`, `tools`, `parallel_tools`, `streaming`, `structured_output`.
+Omit the option for the original full suite. Text is mandatory; parallel_tools
+requires tools; tools with streaming currently requires parallel_tools as well.
+
+The manifest records the selection and a profile hash before execution. Three
+passing repeats remain required. Keep failed campaigns unchanged; narrowing a
+profile requires a new campaign and review of the excluded capabilities. Qualified
+does not mean deployable: human approval precedes a separate automated publisher.
+The kit neither publishes nor changes proxy rules. Documented proxy overrides must
+be tested as explicit adapted profiles, never mistaken for direct upstream support.
+See [the qualification contract](references/protocol.md) for limits and evidence.
 
 ### Optional SDK stage
 

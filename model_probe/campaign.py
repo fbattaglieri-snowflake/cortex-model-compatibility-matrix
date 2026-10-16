@@ -12,6 +12,36 @@ from .protocols import payload, text, calls, completed, tool_match, followup, sc
 
 CASES = ("text", "stream_text", "history", "single", "single_roundtrip", "parallel", "parallel_roundtrip",
          "stream_parallel", "stream_parallel_roundtrip", "error_setup", "error_roundtrip", "structured", "structured_negative")
+CAPABILITIES = ("text", "tools", "parallel_tools", "streaming", "structured_output")
+
+
+def normalize_capabilities(capabilities=None):
+    selected = CAPABILITIES if capabilities is None else tuple(capabilities)
+    if (not selected or len(set(selected)) != len(selected) or not set(selected) <= set(CAPABILITIES)
+            or "text" not in selected):
+        raise ValueError("Capabilities must be unique known names and include text")
+    if "parallel_tools" in selected and "tools" not in selected:
+        raise ValueError("parallel_tools requires tools")
+    # Streaming tools are only covered by the existing parallel-stream fixtures.
+    if "streaming" in selected and "tools" in selected and "parallel_tools" not in selected:
+        raise ValueError("streaming with tools requires parallel_tools coverage in this runner")
+    return tuple(name for name in CAPABILITIES if name in selected)
+
+
+def required_cases(capabilities=None):
+    selected = normalize_capabilities(capabilities)
+    required = {"text", "history"}
+    if "tools" in selected:
+        required.update(("single", "single_roundtrip", "error_setup", "error_roundtrip"))
+    if "parallel_tools" in selected:
+        required.update(("parallel", "parallel_roundtrip"))
+    if "streaming" in selected:
+        required.add("stream_text")
+        if "parallel_tools" in selected:
+            required.update(("stream_parallel", "stream_parallel_roundtrip"))
+    if "structured_output" in selected:
+        required.update(("structured", "structured_negative"))
+    return tuple(name for name in CASES if name in required)
 
 
 def private_write(path, value):
@@ -20,20 +50,23 @@ def private_write(path, value):
         handle.write("\n")
 
 
-def gate(rows, repeats):
+def gate(rows, repeats, capabilities=None):
+    required = set(required_cases(capabilities))
     expected = {(run, name) for run in range(1, repeats + 1) for name in CASES}
     actual = [(row["run"], row["name"]) for row in rows]
     return (repeats >= 3 and set(actual) == expected and len(actual) == len(expected)
-            and all(row["status"] == "PASS" for row in rows))
+            and all(row["status"] == ("PASS" if row["name"] in required else "NOT TESTED") for row in rows))
 
 
 class Campaign:
     def __init__(self, transport, model, protocol, directory, *, repeats=3, reasoning=None,
-                 max_requests=60, deadline=1800, scope="direct-rest"):
+                 max_requests=60, deadline=1800, scope="direct-rest", capabilities=None):
         if not model or repeats < 1 or repeats > 3 or max_requests < 1 or deadline <= 0:
             raise ValueError("Invalid campaign configuration")
         if protocol == "messages" and reasoning is not None:
             raise ValueError("Messages reasoning profiles must not use Chat reasoning parameters")
+        self.capabilities = normalize_capabilities(capabilities)
+        self.required = required_cases(self.capabilities)
         self.transport, self.model, self.protocol = transport, model, protocol
         self.directory = Path(directory)
         self.directory.mkdir(mode=0o700, exist_ok=False)
@@ -41,13 +74,18 @@ class Campaign:
         self.limit, self.deadline, self.scope = max_requests, deadline, scope
         self.rows, self.requests = [], 0
         self.start = time.monotonic()
-        self.manifest = {"schema_version": 1, "version": __version__, "model": model, "protocol": protocol,
+        profile = {"model": model, "protocol": protocol, "reasoning": reasoning,
+                   "required_capabilities": self.capabilities, "required_cases": self.required}
+        profile_hash = hashlib.sha256(json.dumps(profile, sort_keys=True).encode()).hexdigest()
+        self.manifest = {"schema_version": 2, "version": __version__, "model": model, "protocol": protocol,
             "target": transport.base, "scope": scope, "repeats": repeats, "reasoning": reasoning,
             "auth_type": transport.auth_type, "created_utc": datetime.now(timezone.utc).isoformat(),
             "budget": {"requests": max_requests, "output_tokens_per_request": 2048, "between_requests_seconds": deadline},
             "source_sha256": {path.name: hashlib.sha256(path.read_bytes()).hexdigest()
                               for path in Path(__file__).parent.glob("*.py")},
-            "retries": 0, "release_eligible": False}
+            "retries": 0, "release_eligible": False, "profile_sha256": profile_hash,
+            "required_capabilities": self.capabilities, "required_cases": self.required,
+            "destination_policy": transport.destination_policy}
         private_write(self.directory / "manifest.json", self.manifest)
 
     def record(self, row):
@@ -56,6 +94,8 @@ class Campaign:
         self.rows.append(row)
 
     def check(self, run, name, body, validator):
+        if name not in self.required:
+            return None
         row = {"run": run, "name": name, "request": body, "utc": datetime.now(timezone.utc).isoformat()}
         if self.requests >= self.limit or time.monotonic() - self.start >= self.deadline:
             self.record({**row, "status": "BLOCKED", "reason": "Campaign budget exhausted"})
@@ -71,6 +111,11 @@ class Campaign:
             if row["status"] == "FAIL":
                 row["failure_class"] = "HTTP_REJECTION" if meta["http_status"] != 200 else "FIXTURE_MISMATCH"
         except Exception as error:
+            metadata = getattr(error, "evidence_metadata", None)
+            if isinstance(metadata, dict):
+                row.update({key: metadata[key] for key in (
+                    "http_status", "execution_receipt", "request_id", "raw_response"
+                ) if key in metadata})
             row.update(status="FAIL", failure_class=type(error).__name__, error=str(error))
         row["elapsed_seconds"] = round(time.monotonic() - started, 3)
         self.record(row)
@@ -78,13 +123,17 @@ class Campaign:
 
     def run(self):
         for run in range(1, self.repeats + 1):
+            for name in CASES:
+                if name not in self.required:
+                    self.record({"run": run, "name": name, "status": "NOT TESTED",
+                                 "reason": "Outside capability profile declared before campaign"})
             def body(prompt, **kwargs):
                 return payload(self.protocol, self.model, prompt, reasoning=self.reasoning, **kwargs)
             def equals(expected):
                 return lambda value: completed(value, self.protocol) and text(value, self.protocol).strip() == expected and not calls(value, self.protocol)
             first = self.check(run, "text", body("Reply with exactly OK."), equals("OK"))
             if first is None:
-                for name in CASES[1:]:
+                for name in self.required[1:]:
                     self.record({"run": run, "name": name, "status": "BLOCKED", "reason": "Basic text prerequisite failed"})
                 continue
             self.check(run, "stream_text", body("Reply with exactly OK.", stream=True), equals("OK"))
@@ -99,6 +148,8 @@ class Campaign:
                 prompt = "Call lookup_fixture for " + " and ".join(keys) + " in one response. After results return only their numeric sum."
                 if failing:
                     prompt += " If a tool fails, do not retry; reply exactly UNAVAILABLE."
+                if name not in self.required:
+                    continue
                 request = body(prompt, stream=streaming, with_tools=True)
                 result = self.check(run, name, request, lambda value: tool_match(value, self.protocol, keys))
                 next_name = "error_roundtrip" if failing else name + "_roundtrip"
@@ -111,7 +162,11 @@ class Campaign:
                 ("structured_negative", "Return ok true, result 42, and an extra field named forbidden.")):
                 self.check(run, name, body(prompt, structured=True), lambda value:
                     completed(value, self.protocol) and schema_matches(json.loads(text(value, self.protocol))))
-        summary = {"status": "PROFILE_QUALIFIED" if gate(self.rows, self.repeats) else "PROFILE_BLOCKED",
+        qualified = gate(self.rows, self.repeats, self.capabilities)
+        summary = {"status": "PROFILE_QUALIFIED" if qualified else "PROFILE_BLOCKED",
+            "required_capabilities": self.capabilities, "required_cases": self.required,
+            "qualified_capabilities": self.capabilities if qualified else (),
+            "profile_sha256": self.manifest["profile_sha256"],
             "counts": dict(Counter(row["status"] for row in self.rows)), "requests": self.requests,
             "scope": self.scope, "release_eligible": False,
             "not_certified": ["application integration", "durable checkpoints", "billing accuracy",

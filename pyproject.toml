@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "cortex-model-compatibility-matrix"
-version = "0.1.0"
+version = "0.2.0"
 description = "Evidence-based Cortex REST and proxy model qualification"
 requires-python = ">=3.11"
 dependencies = []

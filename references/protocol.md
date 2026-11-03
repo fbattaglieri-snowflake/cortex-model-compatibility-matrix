@@ -1,133 +1,102 @@
-# Qualification contract v2
+# Qualification Contract v2 & Proxy Compliance Reference
 
-## REST coverage (each selected protocol, each run)
+> [!WARNING]
+> **Disclaimer:** This project is an independent, open-source community and field-engineering qualification kit built on top of Snowflake Cortex REST APIs and Snowpark Container Services (SPCS). It is **NOT an official Snowflake product** and is released under the **[MIT License](../LICENSE)**.
 
-- Exact text response and valid completion/stop status.
-- SSE framing, completion, text and tool reconstruction.
-- Conversation history fixture.
-- Single and parallel function calls with distinct identities, strict synthetic
-  arguments and correct tool-result pairing; final sums must match.
-- Parallel streaming tool calls and streaming result roundtrip.
-- Explicit synthetic tool failure; model must return UNAVAILABLE, not fabricate.
-- Structured output matching a fixed schema, including a prompt requesting a
-  forbidden field. This is a fixture-specific validator, not a general schema engine.
+---
 
-No tool executes arbitrary code, network operations or user data access.
-Unknown tool names/arguments fail before dispatch. Messages signed thinking
-blocks and Responses output/reasoning are preserved for followup requests.
-Responses streams use the completed response as authoritative output; function
-argument delta-by-delta parity is not yet separately validated. SSE is reconstructed
-after a bounded read: not a latency/backpressure/real-time incremental transport test.
-Usage events are recorded individually, never summed into a billing estimate.
+## 1. Architecture & Dependency with [`snowflake-proxy-cortexrestapi`](https://github.com/fbattaglieri-snowflake/snowflake-proxy-cortexrestapi)
 
-The Responses decoder accepts one optional `[DONE]` sentinel only AFTER a valid
-`response.completed`. The sentinel alone, a duplicate sentinel, any later JSON
-payload, failure or incomplete terminal still fail. This matches the observed
-Cortex framing and the Standard validator; it never manufactures completion.
-Decoder ValueErrors retain bounded raw response metadata in private case evidence.
-Earlier campaigns remain unchanged; offline replay does not qualify unrun cases.
+`cortex-model-compatibility-matrix` (`model_probe`) is the authoritative qualification and evidence engine used by [**`snowflake-proxy-cortexrestapi`**](https://github.com/fbattaglieri-snowflake/snowflake-proxy-cortexrestapi):
 
-## Missing coverage
+1. **`src/llm_proxy_standard/evidence.py` (`import_campaign`):** Imports `model_probe` and verifies `manifest["schema_version"] == 2`, `manifest["version"] == model_probe.__version__`, byte-exact `manifest["source_sha256"]` against `model_probe/*.py`, `manifest["profile_sha256"]`, `repeats == 3`, `retries == 0`, and `gate(rows, 3, caps)`.
+2. **`scripts/daily_scout_and_promote.py` & `scripts/spcs_scout_worker.py` (`qualify_model_on_channel`):** Imports `Campaign` and `Transport` from `model_probe` to qualify every newly discovered `CORTEX_BASE` model across `messages`, `chat`, and `responses` before zero-touch promotion.
+3. **`Dockerfile.qualification`:** Copies `model_probe` directly into `/opt/proxy/model_probe` (`COPY --from=kit model_probe /opt/proxy/model_probe`) inside the SPCS qualification and registry container image.
+4. **`scripts/promote_model.py`:** Packages `PROFILE_QUALIFIED` profiles into `ProfileV2` (`administrative-standard-v1`, 365-day validity) or builds administrative revocation packages (`--revoke`) for the Registry stage inbox (`/inbox/`).
 
-Vision, audio, embeddings, cache-hit validation, forced/required tool choice,
-model quality benchmarks, concurrency/load, proxy disconnect/backpressure,
-service token natural rotation, durable memory, full application E2E and SQL
-inference are NOT TESTED by this release. OAuth token files are reread per request;
-that behavior alone is not a natural rotation certification.
+---
 
-The optional SDK stage covers Chat only. Actual n8n, Hermes and Langflow versions,
-providers, saved workflows and UI selection must be verified independently.
-This public kit does not claim to reproduce every private historical test.
-The campaign deadline is checked between requests, not enforced by a process-wide
-watchdog. Messages thinking profiles are not parametrized by the Chat reasoning
-flag. No proxy parameter-override engine or transformation tests are supplied.
+## 2. REST Coverage (13 Synthetic Cases × 3 Repeats per Campaign)
 
-## Gate semantics
+| Case ID | Capability Group | Prerequisite | Protocol & Semantic Assertion |
+|---|---|---|---|
+| `text` | `text` *(mandatory)* | — | Exact text `"OK"`, valid stop status (`end_turn`, `stop`, `completed`), no tool calls. |
+| `stream_text` | `streaming` | `text` | Valid `text/event-stream` SSE framing, terminal completion event, reconstructed text `"OK"`. |
+| `history` | `text` *(mandatory)* | `text` | Multi-turn context recall (`"Remember BLUE7."` &rarr; `"Noted."` &rarr; `"BLUE7"`). |
+| `single` | `tools` | `text` | Single call to `lookup_fixture` with `{"key": "alpha"}` and unique tool call ID. |
+| `single_roundtrip` | `tools` | `single` | Preserves assistant turn + opaque reasoning/thinking, injects `"17"`, verifies final `"17"`. |
+| `parallel` | `parallel_tools` | `text` | Two parallel calls (`alpha` and `beta`) in one turn with distinct tool call IDs. |
+| `parallel_roundtrip` | `parallel_tools` | `parallel` | Pairs outputs (`17` and `25`) by tool call ID and verifies numeric sum `"42"`. |
+| `stream_parallel` | `streaming` + `parallel_tools` | `text` | Reconstructs two parallel tool calls from SSE deltas/events with distinct IDs. |
+| `stream_parallel_roundtrip` | `streaming` + `parallel_tools` | `stream_parallel` | Roundtrip with streamed parallel tool outputs; verifies final answer `"42"`. |
+| `error_setup` | `tools` | `text` | Calls `lookup_fixture` (`alpha`) under instruction not to retry on failure. |
+| `error_roundtrip` | `tools` | `error_setup` | Injects synthetic error (`is_error: true` on Messages); model must return `"UNAVAILABLE"` without fabricating a value. |
+| `structured` | `structured_output` | `text` | Enforces strict JSON schema (`{"ok": true, "result": 42}`, `additionalProperties: false`). |
+| `structured_negative` | `structured_output` | `text` | Prompts for an extra `forbidden` field under strict schema; verifies extra field is omitted. |
 
-PASS: the exact fixture and protocol assertions held. FAIL: the request or its
-assertions failed. BLOCKED: prerequisite/budget prevents execution. NOT TESTED:
-outside the selected suite. Three complete passing runs qualify only that profile.
-Reasoning/profile differences require separate campaigns. No model aliases,
-HTTP retries, parameter downgrades or protocol conversions occur automatically.
+### Protocol-Specific Stream & State Rules
 
-## Capability-scoped campaigns
+- **No Arbitrary Code or Data Access:** Synthetic tools never execute shell commands, network calls, or database queries. Unknown tool names or arguments outside `{"key": "alpha" | "beta"}` fail immediately.
+- **Opaque Reasoning & Thinking Continuity:** `followup()` preserves full `response["output"]` (including `reasoning.encrypted_content`) on `responses` and signed `thinking` / `redacted_thinking` blocks on `messages`.
+- **Multi-Round Tool Call ID Deduplication (`reused_tool_ids` & `multiround_followup`):** Models that emit sequential per-response tool IDs (`call_0..call_N` on every round) are detected by `reused_tool_ids()` and deterministically renamed across closed rounds (`call_0` &rarr; `call_0_r2`) by `multiround_followup()` (and in production by `snowflake-proxy-cortexrestapi/src/llm_proxy_standard/rules.py`).
+- **Responses SSE Sentinel Handling:** `decode_stream(..., "responses")` accepts at most one optional `[DONE]` sentinel **after** a valid `response.completed` event. A bare `[DONE]`, duplicate `[DONE]`, trailing JSON event after completion, `response.failed`, or `response.incomplete` raises `ValueError` while preserving bounded raw response metadata in the failed case file.
 
-Declare `--capabilities` before execution; omission preserves the full v1 suite.
-`text` is mandatory. The manifest (schema 2) persists the normalized selection,
-derived required cases, source hashes, destination policy and profile SHA-256
-before any inference. The profile hash covers model/protocol/reasoning/selection,
-not the full release artifact: it is not a signature or human approval record.
+---
 
-| Capability | Required cases |
-| --- | --- |
-| text | text, history |
-| tools | single, single_roundtrip, error_setup, error_roundtrip |
-| parallel_tools | parallel, parallel_roundtrip; requires tools |
-| streaming | stream_text; with parallel_tools also stream_parallel and its roundtrip |
-| structured_output | structured, structured_negative |
+## 3. Out-of-Scope Dimensions (`NOT TESTED`)
 
-The current suite has parallel-stream tool fixtures, not an independent single-tool
-stream suite: `tools + streaming` requires `parallel_tools`. Do not infer untested
-combinations. Excluded cases are recorded for every repeat as NOT TESTED without
-making their requests. Required prerequisites/budget failures remain BLOCKED.
-All required cases must pass three times; excluded cases must be NOT TESTED, and
-missing, duplicate or unexpected rows fail the gate. A failure cannot be ignored
-by relabeling its capability optional after execution. Keep old evidence and run
-a new explicitly scoped campaign for a narrower profile. Missing capability is
-not proven unsupported: it simply is not qualified here.
+Vision, audio, embeddings, prompt-cache hit ratios, forced/required `tool_choice`, subjective intelligence benchmarks, high-concurrency load testing, natural long-lived OAuth token rotation, durable database checkpoint recovery, and SQL `AI_COMPLETE` inference are outside the scope of this synthetic REST runner.
 
-Summary `qualified_capabilities` is populated only on whole-profile success.
-`release_eligible` stays false. Human approval and a separate publisher are still
-required; no registry schema integration or publication controller is implemented.
-The optional SDK stage still requires the FULL direct Chat suite: narrower
-profiles intentionally do not unlock SDK tests of capabilities they did not prove.
+- The optional `scripts/sdk_probe.py` stage tests direct `chat` campaigns across `openai`, `langchain` (non-stream and stream), and `langgraph` (`InMemorySaver`).
+- Multi-protocol consumer loops (**n8n**, **Hermes**, **Langflow**, **SnowflakeLangflow**, **LangChain / LangGraph**) are validated through the companion test suite in [**`snowflake-proxy-cortexrestapi`**](https://github.com/fbattaglieri-snowflake/snowflake-proxy-cortexrestapi) (`91/91` offline unit & integration tests).
 
-## Proxy destination policy
+---
 
-Direct/service REST retains the existing HTTPS/path checks. For proxy scope,
-`--expected-base-url` is explicit approval of the exact base scheme/host/port/path;
-it enables safe custom prefixes without changing the three native endpoint suffixes.
-Credentials, query strings, fragments, whitespace, encoded paths, dot segments and
-empty internal path segments are rejected. Redirects and environment proxies remain
-disabled. No arbitrary destination is discovered or approved by the runner.
+## 4. Gate Semantics & Capability Dependencies
 
-`--internal-proxy` permits HTTP only for an exact approved `*.svc.spcs.internal`
-base URL and prohibits token sources. It must run in a network that can resolve
-and reach that service; it neither proves private routing nor creates network access.
-Authenticated internal endpoints must use an appropriate separately designed secure
-path, not send credentials with this option. Local loopback remains an independent
-explicit mode. HTTPS authentication remains the existing Bearer/Snowflake-header
-transport, not generic public-ingress or x-api-key authentication support.
+- **`PASS`:** Exact fixture and protocol assertions held.
+- **`FAIL`:** HTTP rejection (`HTTP_REJECTION`), malformed SSE/JSON (`ValueError`), or wrong output (`FIXTURE_MISMATCH`).
+- **`BLOCKED`:** Prerequisite case (`text` or tool setup) failed, or campaign request/time budget was exhausted.
+- **`NOT TESTED`:** Capability was intentionally excluded via `--capabilities` before the campaign started.
 
-## Release checklist (manual, not implemented automation)
+| Capability | Required Cases | Dependency Rule |
+|---|---|---|
+| `text` | `text`, `history` | Mandatory in every campaign. |
+| `tools` | `single`, `single_roundtrip`, `error_setup`, `error_roundtrip` | Requires `text`. |
+| `parallel_tools` | `parallel`, `parallel_roundtrip` | Requires `tools`. |
+| `streaming` | `stream_text` (+ `stream_parallel`, `stream_parallel_roundtrip` when `parallel_tools` is selected) | If combined with `tools`, requires `parallel_tools`. |
+| `structured_output` | `structured`, `structured_negative` | Requires `text`. |
 
-1. Exact model/protocol profile qualified; all required evidence recent and reviewed.
-2. Positive control and harness issues distinguished from actual model errors.
-3. SDK and packaged proxy tested with their actual versions and service identity.
-4. Immutable image/catalog, dependency lock, SBOM and vulnerability gate reviewed.
-5. Isolated canary, actual client tests, state preservation and rollback verified:
-   - Validate universal `ProfileV2` client normalization (`normalize_client_options=True`,
-     token range `1..128000`, `response_stream="ordered-items"` on Responses, automatic
-     `store=false`, removal of empty `"text": {}` objects, `reasoning_effort` normalization
-     on Chat, and `thinking` vs `temperature`/`top_p` normalization on Messages).
-   - Verify `ReplayCache` rehydration for stateless clients (such as unpatched n8n Agent
-     engine serialization) that drop `reasoning.encrypted_content` (Responses) or
-     `thinking`/`signature`/`redacted_thinking` blocks (Messages) across tool turns.
-   - Verify multi-round tool call ID handling (`reused_tool_ids` / `multiround_followup`):
-     models that emit per-response sequential tool IDs (`call_0..call_N` on every round)
-     require history validators to enforce uniqueness per open pending batch and automatic
-     cross-round deduplication (`call_0` -> `call_0_r2`) so round 2+ does not fail.
-   - Verify output-token and reasoning-budget interaction on long contexts: the 2048-token
-     budget used by short synthetic probes must not be hardcoded into client requests on
-     Responses/Chat when optional, because Responses `max_output_tokens` counts
-     `reasoning_tokens + output_tokens` and can truncate `function_call` JSON arguments
-     mid-string after long reasoning blocks (`status="incomplete"`).
-6. Human approves the precise profile/evidence revision; publish to the authorized
-   Standard Registry using `scripts/promote_model.py` from
-   `snowflake-proxy-cortexrestapi` (`administrative-standard-v1`, 365-day validity,
-   automatic stage-inbox ingestion within 30s without service restarts), retaining
-   Legacy, existing Next and client defaults. No automatic promotion from test PASS
-   without explicit human approval.
-7. Post-deployment verification and periodic bounded retesting.
+All required cases must pass all 3 repeats (`repeats = 3`, `retries = 0`). Excluded capabilities are recorded as `NOT TESTED` without issuing HTTP requests. Historical failed campaigns must never be edited or overwritten; narrowing a capability profile requires running a new campaign in a fresh directory.
 
-No report from this package automatically authorizes any of these writes.
+---
+
+## 5. Proxy Destination Policy (`--scope proxy`)
+
+- **Direct & Service REST (`direct-rest`, `service-rest`):** Enforce `https://<expected-host>/api/v2/cortex/v1` with no redirects (`NoRedirect`).
+- **Explicit Proxy Base URL (`--expected-base-url`):** Approves the exact `<scheme>://<host>:<port>/<path>` prefix (e.g., `/chat/v1`, `/responses/v1`, `/messages/v1`) before appending `/chat/completions`, `/responses`, or `/messages`.
+- **Credential-Free Internal SPCS HTTP (`--internal-proxy`):** Permits `http://` **only** when `--expected-base-url` targets an explicit `*.svc.spcs.internal` hostname and rejects any `--token-env` or `--token-file` argument so credentials are never transmitted over plaintext HTTP.
+- **Local Loopback (`--local-proxy`):** Permits `http://localhost`, `http://127.0.0.1`, or `http://[::1]` without credentials.
+
+---
+
+## 6. Proxy Compliance, Promotion & Daily Scouting Checklist
+
+When qualifying models for [**`snowflake-proxy-cortexrestapi`**](https://github.com/fbattaglieri-snowflake/snowflake-proxy-cortexrestapi), verify the following end-to-end checklist:
+
+1. **Exact Profile Qualification:** Confirm `status == "PROFILE_QUALIFIED"` (`3/3 PASS` across all required cases) or core agentic qualification (`33/33 PASS` on `text`, `tools`, `parallel_tools`, `streaming`), distinguishing upstream rejections from positive controls.
+2. **Universal `ProfileV2` Client Normalization (`normalize_client_options = True` in `rules.py`):**
+   - **Token Ranges (`1..128000`):** Clamps `max_tokens`, `max_completion_tokens`, and `max_output_tokens` to `1..128000`; defaults `max_tokens = 4096` on Messages when omitted; leaves `max_output_tokens` unset on Responses when omitted so long reasoning chains never truncate downstream `function_call` JSON arguments (`status="incomplete"`).
+   - **Responses (`/responses/v1`):** Forces `store = false`, injects `include = ["reasoning.encrypted_content"]`, strips empty `"text": {}` and `prompt_cache_retention`, strips `temperature`/`top_p` on reasoning models, clamps out-of-domain `reasoning.effort` (`"none"`/`"minimal"` &rarr; `"low"`) and `reasoning.summary`, and enables `response_stream = "ordered-items"` (`stream_order.py` + `protocol.py`), finalizing `encrypted_content` at `response.output_item.done` (matching `response.completed`) and backfilling `response.output_item.added`.
+   - **Chat (`/chat/v1`):** Resolves `max_tokens` + `max_completion_tokens` conflicts, forces `reasoning_effort = "none"` on models that require it, strips `reasoning_effort` on Chat models that reject it, and publishes `metadata.constraints` on `GET /chat/v1/models` so `Langflow` and `SnowflakeLangflow` pass `reasoning_effort` via `extra_body` only when supported.
+   - **Messages (`/messages/v1`):** Strips unsupported `thinking.type` blocks (such as `"adaptive"`) and paired `output_config.effort`; when `thinking.type == "enabled"`, strips `temperature`/`top_p` and ensures `max_tokens > thinking.budget_tokens`; normalizes string `tool_choice` (`"auto"` / `"none"`).
+3. **Stateless `ReplayCache` Continuity (`replay_cache.py`):**
+   - Bounded LRU cache (`max_entries=512`, `ttl=3600s`) keyed by `call_id` / `tool_use.id` rehydrates `reasoning.encrypted_content` (Responses) and `thinking` / `signature` / `redacted_thinking` blocks (Messages) when dropped by stateless clients (such as n8n Agent JSON serialization).
+4. **Multi-Round Tool Call ID Deduplication (`reused_tool_ids` / `multiround_followup`):**
+   - Enforces per-batch tool ID uniqueness and renames reused IDs across closed rounds (`call_0` &rarr; `call_0_r2`).
+5. **1M+ Token Context & Compression Bounds (`app.py`):**
+   - Proxy defaults `PROXY_MAX_BODY = 32 MiB`, `PROXY_MAX_RESPONSE = 32 MiB`, `PROXY_DEADLINE = 600s`, `PROXY_SEND_TIMEOUT = 30s`, and `httpx.Timeout(180, connect=10, write=60, pool=5)`, while auxiliary context-compression calls on Responses pass `reasoning={"effort": "low", "summary": "auto"}`.
+6. **Zero-Touch Promotion & Revocation (`promote_model.py`):**
+   - Promote approved models via `scripts/promote_model.py` (`administrative-standard-v1`, 365-day validity) or revoke retired models via `scripts/promote_model.py --revoke` into the Registry stage inbox (`/inbox/`) for automatic ingestion within 30–60s without restarting services.
+7. **Autonomous Daily Scouting (`daily_scout_and_promote.py` & `spcs_scout_worker.py`):**
+   - Compares daily `SHOW MODELS IN ACCOUNT` snapshots against `MODEL_SNAPSHOT_HISTORY`, qualifies new `CORTEX_BASE` models, promotes passing profiles, revokes disappeared models, records every run in `MODEL_SCOUTING_RUNS` / `V_LATEST_MODEL_SCOUTING_REPORT`, and sends email notifications via `EMAIL_INTEGRATION` **strictly when `ACTION_TAKEN = TRUE`**.

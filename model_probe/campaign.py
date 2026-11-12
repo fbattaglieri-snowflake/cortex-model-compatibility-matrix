@@ -145,7 +145,10 @@ class Campaign:
             for name, keys, streaming, failing in (("single", ["alpha"], False, False),
                 ("parallel", ["alpha", "beta"], False, False),
                 ("stream_parallel", ["alpha", "beta"], True, False), ("error_setup", ["alpha"], False, True)):
-                prompt = "Call lookup_fixture for " + " and ".join(keys) + " in one response. After results return only their numeric sum."
+                if len(keys) == 1:
+                    prompt = f"Call lookup_fixture for ONLY {keys[0]} in one response (1 tool call only). After the result returns, reply with only its numeric value."
+                else:
+                    prompt = "Call lookup_fixture for " + " and ".join(keys) + " in one response. After results return only their numeric sum."
                 if failing:
                     prompt += " If a tool fails, do not retry; reply exactly UNAVAILABLE."
                 if name not in self.required:
